@@ -1,0 +1,512 @@
+--- a/fbdoom/i_input_tty.c
++++ b/fbdoom/i_input_tty.c
+@@ -32,6 +32,8 @@
+ #include "config.h"
+ #include "deh_str.h"
+ #include "doomtype.h"
++#include "doomstat.h"
++#include "g_game.h"
+ #include "doomkeys.h"
+ #include "i_joystick.h"
+ #include "i_system.h"
+@@ -426,12 +428,72 @@
+ }
+ 
+ 
++/* ---- evdev keyboard (FBDOOM_EVDEV=/dev/input/eventN, FBDOOM_GRAB=1 for EVIOCGRAB): Linux keycodes = low AT scancodes ---- */
++static int evfd = -1;
++struct evrec { unsigned int sec, usec; unsigned short type, code; int value; };
++static unsigned char EvKey(unsigned int code)
++{
++    switch (code) {
++    case 17: return KEY_UPARROW;     /* W */
++    case 31: return KEY_DOWNARROW;   /* S */
++    case 30: return KEY_LEFTARROW;   /* A */
++    case 32: return KEY_RIGHTARROW;  /* D */
++    case 72: return KEY_UPARROW;     /* keypad 8 */
++    case 80: return KEY_DOWNARROW;   /* keypad 2 */
++    case 75: return KEY_LEFTARROW;   /* keypad 4 */
++    case 77: return KEY_RIGHTARROW;  /* keypad 6 */
++    case 82: return KEY_FIRE;        /* keypad 0 */
++    case 28: return KEY_ENTER;
++    }
++    return code < sizeof(at_to_doom) ? at_to_doom[code] : 0;
++}
++extern int vfd_ui_state, vfd_menu_sel, vfd_game_started, vfd_god, vfd_spawn;   /* i_video_fbdev.c: 0 play, 1 logo, 2 menu */
++static unsigned char evheld[128];                           /* codes currently held by the game (so a menu opening can release them) */
++static void UiKey(unsigned int code, int value)
++{   /* menu: W/up = previous, S/down = next, keypad 0 / Enter = select, keypad 1 = cancel. items: ORIG WAVE FREE EXIT */
++    if (!value) return;
++    if (vfd_ui_state == 1) return;                           /* logo: ignore keys */
++    if (code == 17 || code == 103) vfd_menu_sel = (vfd_menu_sel + 3) & 3;
++    else if (code == 31 || code == 108) vfd_menu_sel = (vfd_menu_sel + 1) & 3;
++    else if (code == 82 || code == 28) {
++        if (vfd_menu_sel == 3) { kbd_shutdown(); I_Quit(); }
++        vfd_god = vfd_menu_sel != 0; vfd_spawn = vfd_menu_sel == 1;       /* ORIG: normal | WAVE: god + zombies | FREE: god, no extra enemies */
++        G_DeferedInitNew(sk_medium, 1, 1); paused = false; vfd_game_started = 1; vfd_ui_state = 0;
++    } else if (code == 79 && vfd_game_started) { paused = false; vfd_ui_state = 0; }   /* cancel = back to the game */
++}
++static void EvdevPoll(void)
++{
++    struct evrec e;
++    while (read(evfd, &e, sizeof e) == (ssize_t)sizeof e) {
++        event_t event;
++        if (e.type != 1 || e.value == 2) continue;          /* EV_KEY press/release only (no autorepeat) */
++        if (e.code == 14 && e.value == 1) { kbd_shutdown(); I_Quit(); }   /* Backspace = quit */
++        if (getenv("FBDOOM_UI") && e.code == 1) continue;     /* Esc would open the (invisible) stock DOOM menu */
++        if (getenv("FBDOOM_UI")) {
++            if (vfd_ui_state != 0) { UiKey(e.code, e.value); continue; }
++            if (e.code == 79 && e.value == 1) {                     /* keypad 1 during play: open the menu, release held keys first */
++                unsigned int c;
++                for (c = 0; c < 128; c++) if (evheld[c]) { event_t up; up.type = ev_keyup; up.data1 = EvKey(c); up.data2 = up.data3 = 0; if (up.data1) D_PostEvent(&up); evheld[c] = 0; }
++                vfd_ui_state = 2; vfd_menu_sel = 0; paused = true; continue;
++            }
++        }
++        if (e.code < 128) evheld[e.code] = e.value ? 1 : 0;
++        event.data1 = EvKey(e.code); event.data2 = 0; event.data3 = 0;
++        if (!event.data1) continue;
++        event.type = e.value ? ev_keydown : ev_keyup;
++        if (e.value) event.data2 = event.data1 >= 'a' && event.data1 <= 'z' ? event.data1 : 0;
++        D_PostEvent(&event);
++    }
++}
++
+ void I_GetEvent(void)
+ {
+     event_t event;
+     int pressed;
+     unsigned char key;
+ 
++    if (evfd >= 0) { EvdevPoll(); return; }
++
+     // put event-grabbing stuff in here
+     
+     while (kbd_read(&pressed, &key))
+@@ -493,6 +555,15 @@
+ 
+ void I_InitInput(void)
+ {
++    if (getenv("FBDOOM_EVDEV")) {
++        evfd = open(getenv("FBDOOM_EVDEV"), O_RDONLY | O_NONBLOCK);
++        if (evfd < 0) perror("FBDOOM_EVDEV");
++        else {
++            if (getenv("FBDOOM_GRAB")) { int one = 1; if (ioctl(evfd, 0x40044590, &one) != 0) perror("EVIOCGRAB"); }
++            fprintf(stderr, "evdev keyboard on %s\n", getenv("FBDOOM_EVDEV"));
++            return;
++        }
++    }
+     kbd_init();
+ 
+     //UpdateFocus();
+--- a/fbdoom/i_timer.c
++++ b/fbdoom/i_timer.c
+@@ -21,6 +21,7 @@
+ 
+ #include <stdarg.h>
+ #include <sys/time.h>
++#include <sys/times.h>
+ #include <unistd.h>
+ 
+ //
+@@ -32,11 +33,9 @@
+ 
+ int I_GetTicks(void)
+ {
+-    struct timeval  tp;
+-    struct timezone tzp;
+-  
+-    gettimeofday(&tp, &tzp);
+-    return (tp.tv_sec * 1000) + (tp.tv_usec / 1000); /* return milliseconds */
++    /* HD900B: gettimeofday() freezes after the first call; times() runs at 100 Hz */
++    struct tms tm;
++    return (int)(times(&tm) * 10);   /* milliseconds */
+ }
+ 
+ int  I_GetTime (void)
+--- a/fbdoom/i_video_fbdev.c
++++ b/fbdoom/i_video_fbdev.c
+@@ -35,6 +35,12 @@
+ 
+ #include "tables.h"
+ #include "doomkeys.h"
++#include "doomstat.h"
++#include "p_local.h"
++#include "r_state.h"
++#include <math.h>
++#include <sys/times.h>
++#include "g_game.h"
+ 
+ #include <stdbool.h>
+ #include <stdlib.h>
+@@ -164,15 +170,16 @@
+     int i;
+ 
+     /* Open fbdev file descriptor */
+-    fd_fb = open("/dev/fb0", O_RDWR);
+-    if (fd_fb < 0)
++    if (getenv("FBDOOM_NOFB")) { fb.xres = 320; fb.yres = 200; fb.bits_per_pixel = 32; fd_fb = -1; }
++    else fd_fb = open("/dev/graphics/fb0", O_RDWR);
++    if (fd_fb < 0 && !getenv("FBDOOM_NOFB"))
+     {
+         printf("Could not open /dev/fb0");
+         exit(-1);
+     }
+ 
+     /* fetch framebuffer info */
+-    ioctl(fd_fb, FBIOGET_VSCREENINFO, &fb);
++    if (fd_fb >= 0) ioctl(fd_fb, FBIOGET_VSCREENINFO, &fb);
+     /* change params if needed */
+     //ioctl(fd_fb, FBIOPUT_VSCREENINFO, &fb);
+     printf("I_InitGraphics: framebuffer: x_res: %d, y_res: %d, x_virtual: %d, y_virtual: %d, bpp: %d, grayscale: %d\n",
+@@ -397,6 +404,340 @@
+ {
+ }
+ 
++
++/* ---- HD900B VFD output: 320x200 -> 45x7 (2 planes: dim/bright), written to $FBDOOM_VFD (default /tmp/vfd/frame) ---- */
++
++/* autopilot (FBDOOM_AUTO): hold forward, turn left/right in a fixed cycle, so a demo needs no keyboard */
++static double ap_c, ap_l, ap_r, ap_x, ap_y;
++static double ap_ed = 99999.0; static int ap_ecx = -1;
++static int nc = 45;   /* columns actually rendered (FBDOOM_COLS: 45 / 40 = 2 groups / 20 = 1 group); rest stays blank */
++
++static int ap_state = 0, ap_t = 0;
++static void ap_key(int k, int down) { event_t e; e.type = down ? ev_keydown : ev_keyup; e.data1 = k; e.data2 = 0; D_PostEvent(&e); }
++static void autopilot(void)
++{   /* steer by the ray distances: turn away from near walls, otherwise walk forward; aim and fire at visible enemies */
++    static int cf = 0, ct = 0, hold = 0, cfire = 0;
++    int wf, wt, want = 0;
++    if (!getenv("FBDOOM_AUTO")) return;
++    if (hold > 0) hold--;
++    if (ap_ecx >= 0) {                                                       /* enemy visible */
++        int err = ap_ecx - nc / 2;
++        ct = err < -1 ? -1 : err > 1 ? 1 : 0; want = (err >= -1 && err <= 1); hold = 2;
++        wf = (ap_ed > 200.0 && ap_c > 90.0) ? 1 : 0;
++    } else {
++        { static int n; static double lx, ly; static int esc;
++          if (++n >= 30) { n = 0; if (cf && ap_x - lx < 4.0 && lx - ap_x < 4.0 && ap_y - ly < 4.0 && ly - ap_y < 4.0) esc = 20; lx = ap_x; ly = ap_y; }
++          if (esc > 0) { esc--; if (ct == 0) { ct = 1; } hold = 2; if (esc == 0) ct = 0; } }
++        if (ct == 0 && ap_c < 130.0) { ct = ap_l > ap_r ? -1 : 1; hold = 12; }       /* start turning away from the wall */
++        else if (ct != 0 && hold == 0 && ap_c > 260.0) ct = 0;                         /* stop turning once the way is open */
++        else if (ct == 0 && ap_l < 70.0 && ap_r > ap_l) { ct = 1; hold = 3; }          /* nudge off side walls */
++        else if (ct == 0 && ap_r < 70.0 && ap_l > ap_r) { ct = -1; hold = 3; }
++        wf = (ap_c > 90.0) ? 1 : 0;
++    }
++    wt = ct;
++    if (want != cfire) { cfire = want; ap_key(KEY_FIRE, cfire); }
++    if (wf != cf) { cf = wf; ap_key(KEY_UPARROW, cf); }
++    if (wt != ap_state) {
++        if (ap_state) ap_key(ap_state > 0 ? KEY_RIGHTARROW : KEY_LEFTARROW, 0);
++        ap_state = wt;
++        if (ap_state) ap_key(ap_state > 0 ? KEY_RIGHTARROW : KEY_LEFTARROW, 1);
++    }
++    (void)ap_t;
++}
++
++/* ---- plan A: native 45x7 rendering. 45 rays against the map -> wall height bars (distance), things as blinking blocks.
++ * out[0..44] = dim plane (shown every other pass), out[45..89] = bright plane. bit0 = top row.            */
++#define RAYCOLS 45
++#define PLANE 45
++#define RAYMAX  1800.0
++#define ROWK    230.0
++
++static int ray_frame; static char sty = 'A'; static int sty_age;
++static double ray_hit(double ox, double oy, double dx, double dy)
++{
++    double best = RAYMAX; int i;
++    for (i = 0; i < numlines; i++) {
++        line_t *l = &lines[i];
++        double x1 = l->v1->x / 65536.0, y1 = l->v1->y / 65536.0, ex = l->dx / 65536.0, ey = l->dy / 65536.0;
++        double den = dx * ey - dy * ex, t, u;
++        if (den > -1e-9 && den < 1e-9) continue;
++        t = ((x1 - ox) * ey - (y1 - oy) * ex) / den;     /* distance along ray */
++        u = ((x1 - ox) * dy - (y1 - oy) * dx) / den;     /* position along segment */
++        if (t < 1.0 || t >= best || u < 0.0 || u > 1.0) continue;
++        if (l->backsector) {                              /* two-sided: solid only if player cannot pass */
++            sector_t *f = l->frontsector, *b = l->backsector;
++            fixed_t fl = f->floorheight > b->floorheight ? f->floorheight : b->floorheight;
++            fixed_t cl = f->ceilingheight < b->ceilingheight ? f->ceilingheight : b->ceilingheight;
++            fixed_t step = f->floorheight > b->floorheight ? f->floorheight - b->floorheight : b->floorheight - f->floorheight;
++            if (cl - fl >= 56 * FRACUNIT && step <= 24 * FRACUNIT) continue;
++        }
++        best = t;
++    }
++    return best;
++}
++
++/* visible enemies -> screen columns. returns count; fills ecx (centre col), ew (width), ed (perp distance), eh (height units) */
++#define MAXEN 16
++static double as_ang = 9.0;   /* signed angle (rad, + = left) of the visible enemy closest to the crosshair, for the aim assist */
++static int ray_enemies(double ox, double oy, double a, const double *dist, int *ecx, int *ew, double *ed, double *eh)
++{
++    thinker_t *th; int n = 0, i; double best = 1e9;
++    ap_ecx = -1; ap_ed = 99999.0; as_ang = 9.0;
++    for (th = thinkercap.next; th != &thinkercap && n < MAXEN; th = th->next) {
++        mobj_t *mo; double dx, dy, ang, d; int cx, w;
++        if (th->function.acp1 != (actionf_p1)P_MobjThinker) continue;
++        mo = (mobj_t *)th;
++        if (!((mo->flags & MF_COUNTKILL) && mo->health > 0) || (mo->flags & MF_MISSILE)) continue;
++        dx = mo->x / 65536.0 - ox; dy = mo->y / 65536.0 - oy;
++        ang = atan2(dy, dx) - a; while (ang > 3.14159265) ang -= 6.28318531; while (ang < -3.14159265) ang += 6.28318531;
++        if (ang > 0.79 || ang < -0.79) continue;
++        d = sqrt(dx * dx + dy * dy) * cos(ang);
++        if (d < 8.0) continue;
++        cx = (int)((1.0 - tan(ang)) * 0.5 * nc);
++        w = (int)((mo->radius / 65536.0) / d * nc + 0.5); if (w < 1) w = 1; if (w > 6) w = 6;
++        if (cx < 0 || cx >= nc || d > dist[cx] + 20.0) continue;                   /* hidden behind a nearer wall */
++        if (fabs(ang) < fabs(as_ang)) as_ang = ang;
++        ecx[n] = cx; ew[n] = w; ed[n] = d; eh[n] = mo->height / 65536.0;
++        if (d < best) { best = d; ap_ecx = cx; ap_ed = d; }
++        n++;
++    }
++    (void)i; return n;
++}
++
++/* ---- UI: boot logo, New Game / Exit menu (FBDOOM_UI=1). state 0 = play, 1 = logo, 2 = menu. input side: i_input_tty.c ---- */
++int vfd_ui_state = 0, vfd_menu_sel = 0, vfd_game_started = 0;
++int vfd_god = 0, vfd_spawn = 0;                 /* runtime game mode: ORIG (0,0) / WAVE (1,1) / FREE (1,0); initial values from FBDOOM_GOD / FBDOOM_NOSPAWN */
++static const char *const ui_items[4] = {"ORIG", "WAVE", "FREE", "EXIT"};
++static const unsigned ui_itembar[4] = {0x0007, 0x0078, 0x0780, 0x3800};
++static long ui_t0 = -1;
++static void ui_bar(unsigned char *sym, int n, unsigned mask)
++{   /* lower bar: block b (0..13) = byte b%5, bit 3+b/5.  n = first n blocks, or mask = explicit block bits */
++    int b; memset(sym, 0, 5);
++    for (b = 0; b < 14; b++) if (mask ? (mask >> b) & 1 : b < n) sym[b % 5] |= 1 << (3 + b / 5);
++}
++static const unsigned char *ui_glyph(char c)
++{
++    static const unsigned char G_[] = {0x3e,0x41,0x49,0x49,0x7a}, A_[] = {0x7e,0x11,0x11,0x11,0x7e}, M_[] = {0x7f,0x02,0x0c,0x02,0x7f}, E_[] = {0x7f,0x49,0x49,0x49,0x41},
++        X_[] = {0x63,0x14,0x08,0x14,0x63}, R_[] = {0x7f,0x09,0x19,0x29,0x46}, W_[] = {0x3f,0x40,0x38,0x40,0x3f}, V_[] = {0x1f,0x20,0x40,0x20,0x1f}, F_[] = {0x7f,0x09,0x09,0x09,0x01}, I_[] = {0x00,0x41,0x7f,0x41,0x00}, T_[] = {0x01,0x01,0x7f,0x01,0x01}, D_[] = {0x7f,0x41,0x41,0x22,0x1c}, O_[] = {0x3e,0x41,0x41,0x41,0x3e};
++    switch (c) { case 'G': return G_; case 'A': return A_; case 'M': return M_; case 'E': return E_; case 'X': return X_; case 'R': return R_; case 'W': return W_; case 'V': return V_; case 'F': return F_; case 'I': return I_; case 'T': return T_; case 'D': return D_; default: return O_; }
++}
++static void ui_text(unsigned char *out, const char *t, int nshow)
++{
++    int i; for (i = 0; i < 4 && i < nshow && t[i]; i++) memcpy(out + PLANE + 5 * i, ui_glyph(t[i]), 5);
++}
++static const char *const ui_logo[7] = {"###...##...##..##.##","#++#.#++#.#++#.#####","#++#.#++#.#++#.#.#.#","#++#.#++#.#++#.#.#.#","#++#.#++#.#++#.#...#","#++#.#++#.#++#.#...#","###...##...##..#...#"};
++static int ui_render(unsigned char *out)
++{
++    struct tms tm; long now = (long)times(&tm), e;
++    if (ui_t0 < 0) { ui_t0 = now; vfd_ui_state = 1; }
++    e = now - ui_t0;
++    if (vfd_ui_state == 1 && e >= 450) vfd_ui_state = 2;
++    if (vfd_ui_state != 0) paused = true;                        /* the game waits behind the logo / menu */
++    if (vfd_ui_state == 0) return 0;
++    memset(out, 0, 140);
++    if (vfd_ui_state == 1) {                                     /* logo: 20x7 image of the DOOM logo; '#' bright, '+' grey (dim plane). wipe in from the left, flash, hold; bar sweeps */
++        int x, y, reveal = (int)(e / 4) + 1, flash = (e >= 200 && e < 320 && ((e / 8) & 1));
++        for (x = 0; x < 20 && x < reveal; x++) for (y = 0; y < 7; y++) {
++            char c = ui_logo[y][x];
++            if (c == '#' || (c == '+' && flash)) out[PLANE + x] |= 1 << y;
++            else if (c == '+') out[x] |= 1 << y;
++        }
++        ui_bar(out + 135, e / 18 > 14 ? 14 : (int)(e / 18), 0);
++    } else {
++        ui_text(out, ui_items[vfd_menu_sel & 3], 4);
++        ui_bar(out + 135, 0, ui_itembar[vfd_menu_sel & 3]);        /* bar position = item (ORIG left ... EXIT right) */
++    }
++    return 1;
++}
++static int vfd_ray(unsigned char *out)
++{
++    player_t *pl; mobj_t *me; double ox, oy, a, dist[RAYCOLS], ph[RAYCOLS], rowsf; int x, y; thinker_t *th;
++    { static int dc; if (getenv("FBDOOM_DBG") && ++dc % 10 == 0 && dc < 400) fprintf(stderr, "DBG0 n=%d gamestate=%d gametic=%d lines=%p mo=%p\n", dc, (int)gamestate, gametic, (void*)lines, (void*)players[consoleplayer].mo); }
++    if (gamestate != GS_LEVEL) return 0;
++    pl = &players[consoleplayer]; me = pl->mo;
++    if (!me || !lines) return 0;
++    ox = me->x / 65536.0; oy = me->y / 65536.0; a = me->angle * (6.283185307179586 / 4294967296.0);
++    memset(out, 0, 140);
++    ray_frame++;
++    { static int mi; if (!mi) { mi = 1; vfd_god = getenv("FBDOOM_GOD") != NULL; vfd_spawn = vfd_god && !getenv("FBDOOM_NOSPAWN"); } }
++    if (vfd_god) { pl->cheats |= CF_GODMODE; pl->health = 100; if (pl->ammo[am_clip] < 20) pl->ammo[am_clip] = 50; }
++    if (vfd_spawn && ray_frame % 120 == 60) {   /* fight demo: keep a zombieman about 350 units ahead whenever none is near */
++        thinker_t *t3; int near = 0; double dx2 = cos(a), dy2 = sin(a);
++        for (t3 = thinkercap.next; t3 != &thinkercap; t3 = t3->next) {
++            mobj_t *m3; double ex, ey; if (t3->function.acp1 != (actionf_p1)P_MobjThinker) continue; m3 = (mobj_t *)t3;
++            if (!((m3->flags & MF_COUNTKILL) && m3->health > 0)) continue;
++            ex = m3->x / 65536.0 - ox; ey = m3->y / 65536.0 - oy; if (ex * ex + ey * ey < 700.0 * 700.0) near = 1;
++        }
++        if (!near && ray_hit(ox, oy, dx2, dy2) > 500.0) {
++            P_SpawnMobj(me->x + (fixed_t)(dx2 * 350.0 * 65536.0), me->y + (fixed_t)(dy2 * 350.0 * 65536.0), ONFLOORZ, MT_POSSESSED);
++            if (getenv("FBDOOM_STAT")) fprintf(stderr, "SPAWN f=%d\n", ray_frame);
++        }
++    }
++    { static int ni; if (!ni) { ni = 1; if (getenv("FBDOOM_COLS")) { nc = atoi(getenv("FBDOOM_COLS")); if (nc < 5) nc = 5; if (nc > 45) nc = 45; } } }
++    {   static const char *sl; static int per = 900;
++        if (!sl) { sl = getenv("FBDOOM_STYLE"); if (!sl) sl = "A"; if (getenv("FBDOOM_STYLE_FRAMES")) per = atoi(getenv("FBDOOM_STYLE_FRAMES")); }
++        sty = sl[(ray_frame / per) % strlen(sl)]; sty_age = ray_frame % per;
++    }
++    if (getenv("FBDOOM_DBG") && ray_frame % 5 == 0) fprintf(stderr, "DBG f=%d gametic=%d pos=%.0f,%.0f ang=%.2f menu=%d paused=%d\n", ray_frame, gametic, ox, oy, a, menuactive, paused);
++    for (x = 0; x < nc; x++) {
++        double tn = 1.0 - 2.0 * (x + 0.5) / nc, phi = atan(tn), d;
++        d = ray_hit(ox, oy, cos(a + phi), sin(a + phi));
++        dist[x] = d * cos(phi); ph[x] = phi;
++        if (d >= RAYMAX) { dist[x] = 99999.0; continue; }
++        if (sty != 'A') continue;
++        rowsf = 7.0 * ROWK / dist[x];
++        for (y = 0; y < 7; y++) {
++            double c = rowsf / 2.0 - (y > 3 ? y - 3 : 3 - y) + 0.5;
++            if (c >= 0.75) out[PLANE + x] |= 1 << y; else if (c >= 0.25) out[x] |= 1 << y;
++        }
++    }
++    if (getenv("FBDOOM_DBG") && ray_frame % 20 == 0) fprintf(stderr, "DBG R f=%d pos=%.0f,%.0f a=%.2f d0=%.0f d11=%.0f d22=%.0f d33=%.0f d44=%.0f nl=%d\n", ray_frame, ox, oy, a, dist[0], dist[11], dist[22], dist[33], dist[44], numlines);
++    { double c = 9999, l = 0, r = 0; int k; int k0 = nc * 17 / 45, k1 = nc * 27 / 45, nl = nc / 3, nr = nc - nc * 2 / 3; for (k = k0; k <= k1; k++) if (dist[k] < c) c = dist[k]; for (k = 0; k < nl; k++) l += dist[k]; for (k = nc * 2 / 3; k < nc; k++) r += dist[k]; ap_c = c; ap_l = l / nl; ap_r = r / nr; ap_x = ox; ap_y = oy; }
++    if (getenv("FBDOOM_DIST") && ray_frame % 12 == 0) { int k; fprintf(stderr, "DIST"); for (k = 0; k < nc; k++) fprintf(stderr, " %.0f", dist[k]); fprintf(stderr, "\n"); }
++    if (sty != 'A') {                                                  /* B/G/D: outline & radar styles, bright plane only */
++        int t[RAYCOLS], b[RAYCOLS], k, yy, y0, y1, xx;
++        memset(out, 0, 140);
++        for (x = 0; x < nc; x++) {
++            double d = dist[x], h;
++            if (sty == 'D') { y = 6 - (int)(d / 200.0); if (y < 0) y = 0; if (y > 6) y = 6; if (d > 9999) y = 0; t[x] = b[x] = y; continue; }
++            if (d > 9999) { t[x] = b[x] = 3; continue; }
++            if (sty == 'B') { h = 7.0 * ROWK / d / 2.0; if (h > 3.5) h = 3.5; t[x] = (int)floor(3.0 - h + 0.5 + 0.5); b[x] = (int)floor(3.0 + h - 0.5 + 0.5); }
++            else { h = 3.4 * (1.0 - log((d < 70.0 ? 70.0 : d) / 70.0) / log(1800.0 / 70.0)); if (h < 0) h = 0; t[x] = (int)floor(3.0 - h + 0.5); b[x] = (int)floor(3.0 + h + 0.5); }
++        }
++        for (x = 0; x < nc; x++) {
++            if (t[x] >= 0 && t[x] < 7) out[PLANE + x] |= 1 << t[x];
++            if (b[x] >= 0 && b[x] < 7) out[PLANE + x] |= 1 << b[x];
++            if (x < nc - 1 && dist[x] < 9999 && dist[x + 1] < 9999) {
++                double dn = dist[x] < dist[x + 1] ? dist[x] : dist[x + 1];
++                int dt = t[x] > t[x + 1] ? t[x] - t[x + 1] : t[x + 1] - t[x];
++                double dd = dist[x] > dist[x + 1] ? dist[x] - dist[x + 1] : dist[x + 1] - dist[x];
++                if (sty == 'D' ? (dt >= 2) : (dt >= 2 || dd > 0.35 * dn)) {
++                    xx = dist[x] < dist[x + 1] ? x : x + 1;
++                    y0 = t[x] < t[x + 1] ? t[x] : t[x + 1]; y1 = b[x] > b[x + 1] ? b[x] : b[x + 1];
++                    if (sty == 'D') { y0 = t[x] < t[x + 1] ? t[x] : t[x + 1]; y1 = t[x] > t[x + 1] ? t[x] : t[x + 1]; xx = x; }
++                    if (sty != 'D') for (yy = y0; yy <= y1; yy++) if (yy >= 0 && yy < 7) out[PLANE + xx] |= 1 << yy;
++                }
++            }
++        }
++        if (sty == 'B' || sty == 'G') {                                   /* enemies (solid bars standing on the floor line) + gun */
++            int ecx[MAXEN], ew[MAXEN], ne, e, c, rows, wr;
++            double ed[MAXEN], eh[MAXEN];
++            ne = ray_enemies(ox, oy, a, dist, ecx, ew, ed, eh);
++            if (getenv("FBDOOM_ASSIST") && !getenv("FBDOOM_AUTO") && vfd_ui_state == 0 && !paused && as_ang > -0.22 && as_ang < 0.22)
++                me->angle += (angle_t)(int)(as_ang * 0.2 * (4294967296.0 / 6.283185307179586));   /* aim assist: pull the view 20%/frame toward an enemy within ~12 deg */
++            if (getenv("FBDOOM_STAT")) {
++                static int sf, sv, sfl, sfire; static double smin = 99999.0;
++                thinker_t *t2; int alive = 0, fov = 0;
++                sf++; if (ne > 0) { sv++; if (ap_ed < smin) smin = ap_ed; }
++                if (pl->psprites[ps_flash].state) sfl++;
++                if (pl->psprites[ps_weapon].state && pl->attackdown) sfire++;
++                if (sf % 100 == 0) {
++                    for (t2 = thinkercap.next; t2 != &thinkercap; t2 = t2->next) {
++                        mobj_t *m2; if (t2->function.acp1 != (actionf_p1)P_MobjThinker) continue; m2 = (mobj_t *)t2;
++                        if ((m2->flags & MF_COUNTKILL) && m2->health > 0) { alive++;
++                            { double ddx = m2->x/65536.0-ox, ddy = m2->y/65536.0-oy; if (ddx*ddx+ddy*ddy < 640000.0) fov++; } }
++                    }
++                    fprintf(stderr, "STAT f=%d tic=%d vis=%d flash=%d atk=%d mind=%.0f alive=%d near800=%d kills=%d ammo=%d hp=%d pos=%.0f,%.0f\n",
++                        sf, gametic, sv, sfl, sfire, smin, alive, fov, pl->killcount, pl->ammo[am_clip], pl->health, ox, oy);
++                }
++            }
++            for (e = 0; e < ne; e++) {
++                int c0 = ecx[e] - 1, bb = b[ecx[e]] > 6 ? 6 : b[ecx[e]];
++                double dd = ed[e] < 70.0 ? 70.0 : ed[e];
++                /* height from distance: 6 rows at point blank, 1 row far away (log mapping like the walls) */
++                rows = (int)(6.0 * (1.0 - log(dd / 70.0) / log(1800.0 / 70.0)) + 0.5); if (rows < 1) rows = 1; if (rows > 6) rows = 6;
++                if (bb < rows - 1) bb = rows - 1;
++                for (c = c0; c < c0 + 2; c++) {
++                    if (c < 0 || c >= nc) continue;
++                    out[PLANE + c] = 0;                                      /* blank the wall outline under the enemy */
++                    for (yy = bb - rows + 1; yy <= bb; yy++) if (yy >= 0 && yy < 7) out[2 * PLANE + c] |= 1 << yy;   /* blink plane: vfdmux toggles it */
++                }
++            }
++            {   int cc = nc / 2;                                              /* gun: 3 wide base + barrel, flash = muzzle burst */
++                out[PLANE + cc - 1] = (out[PLANE + cc - 1] & ~0x60) | 0x40;
++                out[PLANE + cc]     = (out[PLANE + cc] & ~0x78) | 0x60;
++                out[PLANE + cc + 1] = (out[PLANE + cc + 1] & ~0x60) | 0x40;
++                {   static int fst = -1, fon;
++                    if (pl->psprites[ps_flash].state) { if (!fon) { fon = 1; fst = gametic; } } else fon = 0;
++                    if (fon && gametic - fst < 4)                                  /* muzzle flash = whole display lit, first 4 tics (~half of the pistol flash) */
++                        for (c = 0; c < nc; c++) { out[PLANE + c] = 0x7f; out[2 * PLANE + c] = 0; }
++                }
++            }
++        }
++        if (getenv("FBDOOM_HUD")) ui_bar(out + 135, pl->health <= 0 ? 0 : (pl->health * 14 + 99) / 100, 0);   /* health on the lower 14-block bar */
++        return 1;
++    }
++    for (th = thinkercap.next; th != &thinkercap; th = th->next) {          /* things in front of walls */
++        mobj_t *mo; double dx, dy, ang, rel, d, wcol, h, bot; int cx, w, c0, c1, c, top, bt, enemy;
++        if (th->function.acp1 != (actionf_p1)P_MobjThinker) continue;
++        mo = (mobj_t *)th;
++        if (mo == me || (mo->flags & MF_MISSILE)) continue;
++        enemy = (mo->flags & MF_COUNTKILL) && mo->health > 0;
++        if (!enemy && !(mo->flags & MF_SPECIAL)) continue;
++        dx = mo->x / 65536.0 - ox; dy = mo->y / 65536.0 - oy;
++        ang = atan2(dy, dx) - a; while (ang > 3.14159265) ang -= 6.28318531; while (ang < -3.14159265) ang += 6.28318531;
++        if (ang > 0.79 || ang < -0.79) continue;
++        d = sqrt(dx * dx + dy * dy) * cos(ang);
++        if (d < 8.0) continue;
++        cx = (int)((1.0 - tan(ang)) * 0.5 * nc);
++        w = (int)(2.0 * (mo->radius / 65536.0) / d * 22.5 + 0.5); if (w < 1) w = 1; if (w > 9) w = 9;
++        if (enemy) { h = 7.0 * ROWK / d * (mo->height / 65536.0) / 128.0; if (h < 1.0) h = 1.0; }
++        else h = 1.0;
++        bot = 3.0 + 7.0 * ROWK / d / 2.0; if (bot > 7.0) bot = 7.0;      /* floor line of a wall at this distance */
++        bt = (int)(bot + 0.5); top = bt - (int)(h + 0.5); if (top < 0) top = 0; if (bt > 7) bt = 7;
++        c0 = cx - w / 2; c1 = c0 + w - 1;
++        for (c = c0; c <= c1; c++) {
++            if (c < 0 || c >= nc || d > dist[c] + 20.0) continue;       /* hidden behind a nearer wall */
++            for (y = 0; y < 7; y++) { out[c] &= ~(1 << y); out[PLANE + c] &= ~(1 << y); }
++            for (y = top; y < bt; y++) {
++                if (enemy) { if ((ray_frame >> 2) & 1) out[PLANE + c] |= 1 << y; else out[c] |= 1 << y; }   /* blinks bright/dim */
++                else out[c] |= 1 << y;                                                                      /* pickup: dim dot */
++            }
++        }
++    }
++    (void)ph;
++    return 1;
++}
++static int vfd_fd = -2;
++static void vfd_emit(void)
++{
++    unsigned char out[140]; int cx, cy, x, y, lum[45][7], lo = 255, hi = 0;
++    if (vfd_fd == -2) {
++        const char *pth = getenv("FBDOOM_VFD");
++        vfd_fd = pth ? open(pth, O_WRONLY | O_CREAT, 0666) : -1;
++    }
++    if (vfd_fd < 0) return;
++    memset(out, 0, sizeof out);
++    if (getenv("FBDOOM_UI") && ui_render(out)) { pwrite(vfd_fd, out, sizeof out, 0); return; }
++    if (getenv("FBDOOM_RAY") && vfd_ray(out)) { pwrite(vfd_fd, out, sizeof out, 0); return; }
++    for (cx = 0; cx < 45; cx++) for (cy = 0; cy < 7; cy++) {
++        int x0 = cx * SCREENWIDTH / 45, x1 = (cx + 1) * SCREENWIDTH / 45, y0 = 40 + cy * 12, sum = 0, n = 0;
++        for (y = y0; y < y0 + 12; y++) for (x = x0; x < x1; x += 2) {
++            struct color c = colors[I_VideoBuffer[y * SCREENWIDTH + x]];
++            sum += (c.r * 30 + c.g * 59 + c.b * 11) / 100; n++;
++        }
++        lum[cx][cy] = sum / n;
++        if (lum[cx][cy] < lo) lo = lum[cx][cy];
++        if (lum[cx][cy] > hi) hi = lum[cx][cy];
++    }
++    {   /* contrast stretch between 8th and 92nd percentile, then 2x2 ordered dither into 2 planes (dim/bright) */
++        int hist[256] = {0}, acc = 0, n = 0;
++        static const int bayer[2][2] = {{0, 2}, {3, 1}};
++        for (cx = 0; cx < 45; cx++) for (cy = 0; cy < 7; cy++) hist[lum[cx][cy]]++;
++        for (lo = 0; lo < 255 && acc + hist[lo] < 25; lo++) acc += hist[lo];
++        acc = 0; for (hi = 255; hi > 0 && acc + hist[hi] < 25; hi--) acc += hist[hi];
++        (void)n; if (hi <= lo + 4) hi = lo + 5;
++        memset(out, 0, sizeof out);
++        for (cx = 0; cx < 45; cx++) for (cy = 0; cy < 7; cy++) {
++            int v = (lum[cx][cy] - lo) * 2000 / (hi - lo);          /* 0..2000 = 0..2 levels x1000 */
++            v += 0; (void)bayer;   /* dither disabled: it only added checker noise at 45x7 */
++            if (v > 500)  out[cx] |= 1 << cy;
++            if (v > 1500) out[45 + cx] |= 1 << cy;
++        }
++    }
++    pwrite(vfd_fd, out, sizeof out, 0);
++}
++
+ //
+ // I_FinishUpdate
+ //
+@@ -407,6 +748,10 @@
+     int x_offset, y_offset, x_offset_end;
+     unsigned char *line_in, *line_out;
+ 
++    autopilot();
++    vfd_emit();
++    if (getenv("FBDOOM_NOFB")) return;
++
+     /* Offsets in case FB is bigger than DOOM */
+     /* 600 = fb heigt, 200 screenheight */
+     /* 600 = fb heigt, 200 screenheight */

@@ -1,0 +1,7 @@
+build/dl/
+build/work/
+*.WAD
+*.wad
+__pycache__/
+*.pyc
+*.log
